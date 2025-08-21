@@ -102,12 +102,12 @@ st.markdown("""
         border-radius: 8px;
         padding: 0.5rem 2rem;
     }
+    /* Hide default streamlit elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
-
-def count_tokens_fallback(text: str) -> int:
-    """Fallback token counting method."""
-    return len(text.split())
 
 def count_tokens(text: str) -> int:
     """Count tokens in text."""
@@ -117,8 +117,8 @@ def count_tokens(text: str) -> int:
             return len(encoding.encode(text))
         except:
             pass
-    # Fallback method
-    return count_tokens_fallback(text)
+    # Fallback: word count approximation
+    return len(text.split())
 
 def extract_text_from_pdf(pdf_file) -> str:
     """Extract text from PDF file."""
@@ -135,39 +135,34 @@ def extract_text_from_pdf(pdf_file) -> str:
         st.error(f"Error reading PDF: {str(e)}")
         return ""
 
-def chunk_text_by_tokens(text: str, min_tokens: int = 500, max_tokens: int = 800) -> List[str]:
-    """Split text into chunks."""
+def chunk_text_simple(text: str, chunk_size: int = 1000) -> List[str]:
+    """Simple text chunking by character count with sentence boundaries."""
     if not text.strip():
         return []
     
     # Clean text
     text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Split into sentences
     sentences = re.split(r'(?<=[.!?])\s+', text)
     
     chunks = []
     current_chunk = ""
-    current_tokens = 0
     
     for sentence in sentences:
-        sentence_tokens = count_tokens(sentence)
-        
-        if current_tokens + sentence_tokens > max_tokens and current_chunk:
-            if current_tokens >= min_tokens:
-                chunks.append(current_chunk.strip())
-                current_chunk = sentence
-                current_tokens = sentence_tokens
-            else:
-                current_chunk += " " + sentence
-                current_tokens += sentence_tokens
+        # If adding this sentence would make chunk too long, save current chunk
+        if len(current_chunk) + len(sentence) > chunk_size and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
         else:
             current_chunk += " " + sentence
-            current_tokens += sentence_tokens
     
     # Add final chunk
-    if current_chunk.strip() and count_tokens(current_chunk) >= min_tokens:
+    if current_chunk.strip():
         chunks.append(current_chunk.strip())
     
-    return [chunk for chunk in chunks if count_tokens(chunk) >= min_tokens]
+    # Filter out very short chunks
+    return [chunk for chunk in chunks if len(chunk) > 200]
 
 def preprocess_text(text: str) -> str:
     """Preprocess text for matching."""
@@ -177,7 +172,7 @@ def preprocess_text(text: str) -> str:
     return text.strip()
 
 class SimpleRetriever:
-    """Simple keyword-based retrieval system."""
+    """Simple retrieval system."""
     
     def __init__(self, chunks: List[str]):
         self.chunks = chunks
@@ -194,7 +189,8 @@ class SimpleRetriever:
                     max_df=0.95
                 )
                 self.chunk_vectors = self.vectorizer.fit_transform(processed_chunks)
-            except:
+            except Exception as e:
+                st.warning(f"TF-IDF setup failed: {e}")
                 self.use_tfidf = False
     
     def retrieve_top_chunks(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
@@ -214,10 +210,9 @@ class SimpleRetriever:
             top_indices = np.argsort(similarities)[::-1][:top_k]
             results = []
             for idx in top_indices:
-                if similarities[idx] > 0:
-                    results.append((self.chunks[idx], similarities[idx]))
+                results.append((self.chunks[idx], similarities[idx]))
             
-            return results if results else self._keyword_retrieval(query, top_k)
+            return results
         except:
             return self._keyword_retrieval(query, top_k)
     
@@ -241,34 +236,34 @@ class SimpleRetriever:
 def query_claude(client, question: str, retrieved_chunks: List[Tuple[str, float]]) -> str:
     """Query Claude with retrieved chunks."""
     if not retrieved_chunks:
-        return "I couldn't find relevant information to answer your question."
+        return "I couldn't find any relevant information in the document to answer your question."
     
-    # Check relevance
+    # Use a much lower threshold - even small similarity can be useful
     max_score = max(score for _, score in retrieved_chunks)
-    if max_score < 0.1:
-        return "This question appears to be outside the scope of the document."
     
-    # Prepare context
+    # Always try to answer if we have chunks, regardless of similarity score
     context_parts = []
-    for i, (chunk, score) in enumerate(retrieved_chunks):
-        context_parts.append(f"Section {i+1}:\n{chunk}")
+    for i, (chunk, score) in enumerate(retrieved_chunks[:3]):  # Limit to top 3
+        context_parts.append(f"Document Section {i+1}:\n{chunk}")
     
     context = "\n\n".join(context_parts)
     
-    prompt = f"""Answer the following question based ONLY on the provided document sections. If the answer is not in the sections, say so.
+    prompt = f"""You are a helpful assistant that answers questions based on the provided document sections. 
+
+Please read through the document sections below and answer the user's question. If the information needed to answer the question is not clearly present in any of the sections, you can say so, but try your best to provide a helpful response based on what is available.
 
 Document Sections:
 {context}
 
-Question: {question}
+User Question: {question}
 
-Answer:"""
+Please provide a helpful answer based on the document sections above:"""
 
     try:
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
-            max_tokens=500,
-            temperature=0.1,
+            max_tokens=800,
+            temperature=0.2,
             messages=[{"role": "user", "content": prompt}]
         )
         return response.content[0].text.strip()
@@ -288,24 +283,15 @@ def main():
         st.markdown(f"""
         <div class="warning-box">
             ⚠️ <strong>Missing packages:</strong> {', '.join(missing_packages)}<br><br>
-            
-            <strong>For Streamlit Cloud:</strong><br>
-            1. Create a <code>requirements.txt</code> file in your repository root<br>
-            2. Add the following lines:<br>
+            Please create a requirements.txt file with:<br>
             <pre>streamlit
 anthropic
 PyPDF2
 scikit-learn
 tiktoken
 numpy</pre>
-            3. Commit and push the changes<br>
-            4. Redeploy your app<br><br>
-            
-            <strong>For local development:</strong><br>
-            Run: <code>pip install {' '.join(missing_packages)}</code>
         </div>
         """, unsafe_allow_html=True)
-        
         return
     
     # Initialize session state
@@ -328,11 +314,7 @@ numpy</pre>
     )
     
     if not api_key:
-        st.markdown("""
-        <div class="warning-box">
-            ⚠️ Please enter your Anthropic API key to continue.
-        </div>
-        """, unsafe_allow_html=True)
+        st.warning("⚠️ Please enter your Anthropic API key to continue.")
         return
     
     # Initialize client
@@ -349,7 +331,7 @@ numpy</pre>
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
     
     if uploaded_file is not None:
-        # Process PDF
+        # Process PDF only if it's a new file
         if "current_pdf" not in st.session_state or st.session_state.current_pdf != uploaded_file.name:
             with st.spinner("Processing PDF..."):
                 pdf_text = extract_text_from_pdf(uploaded_file)
@@ -358,7 +340,8 @@ numpy</pre>
                     st.error("Could not extract text from PDF.")
                     return
                 
-                chunks = chunk_text_by_tokens(pdf_text)
+                # Use simpler chunking
+                chunks = chunk_text_simple(pdf_text, 2000)  # Larger chunks
                 
                 if not chunks:
                     st.error("No valid text chunks created.")
@@ -371,49 +354,95 @@ numpy</pre>
             st.session_state.retriever = retriever
             st.session_state.client = client
             st.session_state.current_pdf = uploaded_file.name
-            st.session_state.messages = []
+            st.session_state.messages = []  # Clear messages for new PDF
             
             method = "TF-IDF + Cosine Similarity" if sklearn_available else "Keyword Matching"
-            st.markdown(f"""
-            <div class="status-success">
-                ✅ PDF processed successfully!<br>
-                📊 Created {len(chunks)} chunks<br>
-                🔍 Using {method}
-            </div>
-            """, unsafe_allow_html=True)
+            st.success(f"✅ PDF processed! Created {len(chunks)} chunks using {method}")
         
         st.markdown("---")
         
         # Chat interface
-        st.subheader("💬 Chat")
+        st.subheader("💬 Chat with your Document")
         
-        # Display messages
-        for message in st.session_state.messages:
-            if message["role"] == "user":
-                st.markdown(f'<div class="user-message">👤 {message["content"]}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="bot-message">🤖 {message["content"]}</div>', unsafe_allow_html=True)
+        # Display messages in a container to prevent infinite loops
+        chat_container = st.container()
+        with chat_container:
+            for i, message in enumerate(st.session_state.messages):
+                if message["role"] == "user":
+                    st.markdown(f'<div class="user-message">👤 {message["content"]}</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<div class="bot-message">🤖 {message["content"]}</div>', unsafe_allow_html=True)
         
-        # Input
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            user_input = st.text_input("Ask about your document:", key="chat_input")
-        with col2:
-            reset = st.button("🔄 Reset")
+        # Input form to prevent auto-rerun
+        with st.form(key="chat_form", clear_on_submit=True):
+            col1, col2 = st.columns([4, 1])
+            
+            with col1:
+                user_input = st.text_input(
+                    "Ask about your document:",
+                    placeholder="e.g., What is the main topic of this document?",
+                    key="user_question"
+                )
+            
+            with col2:
+                submit_button = st.form_submit_button("Send 📤")
+                reset_button = st.form_submit_button("Reset 🔄")
         
-        if user_input:
+        # Process form submission
+        if submit_button and user_input.strip():
+            # Add user message
             st.session_state.messages.append({"role": "user", "content": user_input})
             
-            with st.spinner("Thinking..."):
+            # Generate response
+            with st.spinner("🤔 Thinking..."):
                 retrieved_chunks = st.session_state.retriever.retrieve_top_chunks(user_input, 3)
+                
+                # Debug info (remove in production)
+                if retrieved_chunks:
+                    max_score = max(score for _, score in retrieved_chunks)
+                    st.write(f"Debug: Max similarity score: {max_score:.3f}")
+                
                 response = query_claude(st.session_state.client, user_input, retrieved_chunks)
             
+            # Add bot response
             st.session_state.messages.append({"role": "assistant", "content": response})
+            
+            # Rerun to show new messages
             st.rerun()
         
-        if reset:
+        # Reset functionality
+        if reset_button:
             st.session_state.messages = []
+            st.success("🗑️ Chat history cleared!")
             st.rerun()
+        
+        # Show statistics
+        if st.session_state.messages:
+            user_msg_count = len([msg for msg in st.session_state.messages if msg["role"] == "user"])
+            st.markdown(f"""
+            <div class="info-box">
+                📊 <strong>Chat Stats:</strong> {user_msg_count} questions asked
+            </div>
+            """, unsafe_allow_html=True)
+    
+    else:
+        # Upload prompt
+        st.markdown("""
+        ### 📤 Upload Your PDF Document
+        
+        Upload a PDF file above to start chatting with your document using Claude AI.
+        
+        **Features:**
+        - 🔤 Smart text processing
+        - 🔍 Intelligent content retrieval  
+        - 🤖 Powered by Claude AI
+        - 💬 Interactive chat interface
+        
+        **Example Questions:**
+        - "What is this document about?"
+        - "What are the main points?"
+        - "Summarize the key findings"
+        """)
 
 if __name__ == "__main__":
     main()
