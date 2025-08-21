@@ -1,6 +1,0 @@
-streamlit
-anthropic
-PyPDF2
-scikit-learn
-tiktoken
-numpy
