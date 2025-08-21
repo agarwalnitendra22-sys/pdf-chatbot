@@ -7,12 +7,6 @@ from typing import List, Tuple
 missing_packages = []
 
 try:
-    import anthropic
-except ImportError:
-    missing_packages.append("anthropic")
-    anthropic = None
-
-try:
     import PyPDF2
 except ImportError:
     missing_packages.append("PyPDF2")
@@ -34,7 +28,7 @@ except ImportError:
 
 # Set page config
 st.set_page_config(
-    page_title="PDF Chatbot",
+    page_title="PDF Q&A Tool",
     page_icon="📄",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -52,24 +46,23 @@ st.markdown("""
         text-align: center;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     }
-    .user-message {
-        background: #1f77b4;
-        color: white;
-        padding: 1rem;
-        border-radius: 15px 15px 5px 15px;
-        margin: 0.5rem 0;
-        margin-left: 20%;
-        word-wrap: break-word;
-    }
-    .bot-message {
+    .search-result {
         background: #f0f7ff;
-        color: #1f77b4;
+        border: 1px solid #1f77b4;
+        border-radius: 10px;
         padding: 1rem;
-        border-radius: 15px 15px 15px 5px;
-        margin: 0.5rem 0;
-        margin-right: 20%;
+        margin: 1rem 0;
         border-left: 4px solid #1f77b4;
-        word-wrap: break-word;
+    }
+    .relevance-score {
+        background: #e3f2fd;
+        color: #1f77b4;
+        padding: 0.3rem 0.6rem;
+        border-radius: 15px;
+        font-size: 0.8rem;
+        font-weight: bold;
+        display: inline-block;
+        margin-bottom: 0.5rem;
     }
     .status-success {
         background: #e8f5e8;
@@ -109,17 +102,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def count_tokens(text: str) -> int:
-    """Count tokens in text."""
-    if tiktoken is not None:
-        try:
-            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-            return len(encoding.encode(text))
-        except:
-            pass
-    # Fallback: word count approximation
-    return len(text.split())
-
 def extract_text_from_pdf(pdf_file) -> str:
     """Extract text from PDF file."""
     if PyPDF2 is None:
@@ -135,7 +117,7 @@ def extract_text_from_pdf(pdf_file) -> str:
         st.error(f"Error reading PDF: {str(e)}")
         return ""
 
-def chunk_text_simple(text: str, chunk_size: int = 1000) -> List[str]:
+def chunk_text_simple(text: str, chunk_size: int = 1500) -> List[str]:
     """Simple text chunking by character count with sentence boundaries."""
     if not text.strip():
         return []
@@ -162,7 +144,7 @@ def chunk_text_simple(text: str, chunk_size: int = 1000) -> List[str]:
         chunks.append(current_chunk.strip())
     
     # Filter out very short chunks
-    return [chunk for chunk in chunks if len(chunk) > 200]
+    return [chunk for chunk in chunks if len(chunk) > 100]
 
 def preprocess_text(text: str) -> str:
     """Preprocess text for matching."""
@@ -171,8 +153,8 @@ def preprocess_text(text: str) -> str:
     text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
     return text.strip()
 
-class SimpleRetriever:
-    """Simple retrieval system."""
+class DocumentRetriever:
+    """Document retrieval system."""
     
     def __init__(self, chunks: List[str]):
         self.chunks = chunks
@@ -190,18 +172,17 @@ class SimpleRetriever:
                 )
                 self.chunk_vectors = self.vectorizer.fit_transform(processed_chunks)
             except Exception as e:
-                st.warning(f"TF-IDF setup failed: {e}")
                 self.use_tfidf = False
     
-    def retrieve_top_chunks(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
-        """Retrieve most relevant chunks."""
+    def search_document(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
+        """Search for relevant chunks."""
         if self.use_tfidf:
-            return self._tfidf_retrieval(query, top_k)
+            return self._tfidf_search(query, top_k)
         else:
-            return self._keyword_retrieval(query, top_k)
+            return self._keyword_search(query, top_k)
     
-    def _tfidf_retrieval(self, query: str, top_k: int) -> List[Tuple[str, float]]:
-        """TF-IDF based retrieval."""
+    def _tfidf_search(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        """TF-IDF based search."""
         try:
             processed_query = preprocess_text(query)
             query_vector = self.vectorizer.transform([processed_query])
@@ -214,10 +195,10 @@ class SimpleRetriever:
             
             return results
         except:
-            return self._keyword_retrieval(query, top_k)
+            return self._keyword_search(query, top_k)
     
-    def _keyword_retrieval(self, query: str, top_k: int) -> List[Tuple[str, float]]:
-        """Keyword-based retrieval."""
+    def _keyword_search(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        """Simple keyword-based search."""
         query_words = set(preprocess_text(query).split())
         
         chunk_scores = []
@@ -233,49 +214,27 @@ class SimpleRetriever:
         chunk_scores.sort(key=lambda x: x[1], reverse=True)
         return chunk_scores[:top_k]
 
-def query_claude(client, question: str, retrieved_chunks: List[Tuple[str, float]]) -> str:
-    """Query Claude with retrieved chunks."""
-    if not retrieved_chunks:
-        return "I couldn't find any relevant information in the document to answer your question."
+def extract_keywords(text: str, top_n: int = 10) -> List[str]:
+    """Extract key terms from text."""
+    # Remove common words and clean text
+    words = preprocess_text(text).split()
+    word_freq = {}
     
-    # Use a much lower threshold - even small similarity can be useful
-    max_score = max(score for _, score in retrieved_chunks)
+    # Count word frequencies, excluding very short words
+    for word in words:
+        if len(word) > 3:  # Skip short words
+            word_freq[word] = word_freq.get(word, 0) + 1
     
-    # Always try to answer if we have chunks, regardless of similarity score
-    context_parts = []
-    for i, (chunk, score) in enumerate(retrieved_chunks[:3]):  # Limit to top 3
-        context_parts.append(f"Document Section {i+1}:\n{chunk}")
-    
-    context = "\n\n".join(context_parts)
-    
-    prompt = f"""You are a helpful assistant that answers questions based on the provided document sections. 
-
-Please read through the document sections below and answer the user's question. If the information needed to answer the question is not clearly present in any of the sections, you can say so, but try your best to provide a helpful response based on what is available.
-
-Document Sections:
-{context}
-
-User Question: {question}
-
-Please provide a helpful answer based on the document sections above:"""
-
-    try:
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=800,
-            temperature=0.2,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text.strip()
-    except Exception as e:
-        return f"Error processing question: {str(e)}"
+    # Sort by frequency and return top N
+    sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+    return [word for word, freq in sorted_words[:top_n]]
 
 def main():
     # Check for missing packages
     if missing_packages:
         st.markdown("""
         <div class="main-header">
-            <h1>📄 PDF Chatbot</h1>
+            <h1>📄 PDF Q&A Tool</h1>
             <p>Missing Required Dependencies</p>
         </div>
         """, unsafe_allow_html=True)
@@ -285,7 +244,6 @@ def main():
             ⚠️ <strong>Missing packages:</strong> {', '.join(missing_packages)}<br><br>
             Please create a requirements.txt file with:<br>
             <pre>streamlit
-anthropic
 PyPDF2
 scikit-learn
 tiktoken
@@ -295,36 +253,23 @@ numpy</pre>
         return
     
     # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    if "search_results" not in st.session_state:
+        st.session_state.search_results = []
     
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>📄 PDF Chatbot</h1>
-        <p>Upload a PDF document and ask questions about its content using Claude AI</p>
+        <h1>📄 Free PDF Q&A Tool</h1>
+        <p>Upload a PDF and search through its content - No API key required!</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # API Key
-    api_key = st.text_input(
-        "Enter your Anthropic API Key:", 
-        type="password",
-        help="Get your API key from https://console.anthropic.com/"
-    )
-    
-    if not api_key:
-        st.warning("⚠️ Please enter your Anthropic API key to continue.")
-        return
-    
-    # Initialize client
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-    except Exception as e:
-        st.error(f"Error initializing Claude client: {str(e)}")
-        return
-    
-    st.markdown("---")
+    st.markdown("""
+    <div class="info-box">
+        🆓 <strong>Completely Free!</strong> This tool searches your PDF content without requiring any paid API keys.
+        Simply upload your PDF and search for specific information.
+    </div>
+    """, unsafe_allow_html=True)
     
     # File upload
     st.subheader("📁 Upload PDF")
@@ -340,88 +285,123 @@ numpy</pre>
                     st.error("Could not extract text from PDF.")
                     return
                 
-                # Use simpler chunking
-                chunks = chunk_text_simple(pdf_text, 2000)  # Larger chunks
+                chunks = chunk_text_simple(pdf_text, 1500)
                 
                 if not chunks:
                     st.error("No valid text chunks created.")
                     return
                 
-                retriever = SimpleRetriever(chunks)
+                retriever = DocumentRetriever(chunks)
+                
+                # Extract key topics
+                keywords = extract_keywords(pdf_text, 15)
             
             # Store in session state
             st.session_state.chunks = chunks
             st.session_state.retriever = retriever
-            st.session_state.client = client
             st.session_state.current_pdf = uploaded_file.name
-            st.session_state.messages = []  # Clear messages for new PDF
+            st.session_state.keywords = keywords
+            st.session_state.search_results = []
             
             method = "TF-IDF + Cosine Similarity" if sklearn_available else "Keyword Matching"
-            st.success(f"✅ PDF processed! Created {len(chunks)} chunks using {method}")
+            st.markdown(f"""
+            <div class="status-success">
+                ✅ PDF processed successfully!<br>
+                📊 Created {len(chunks)} searchable sections<br>
+                🔍 Using {method} for search<br>
+                📝 Document length: {len(pdf_text):,} characters
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Show key topics
+            if keywords:
+                st.markdown("**🏷️ Key topics found in document:**")
+                keyword_display = " • ".join(keywords[:10])
+                st.markdown(f"*{keyword_display}*")
         
         st.markdown("---")
         
-        # Chat interface
-        st.subheader("💬 Chat with your Document")
+        # Search interface
+        st.subheader("🔍 Search Your Document")
         
-        # Display messages in a container to prevent infinite loops
-        chat_container = st.container()
-        with chat_container:
-            for i, message in enumerate(st.session_state.messages):
-                if message["role"] == "user":
-                    st.markdown(f'<div class="user-message">👤 {message["content"]}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="bot-message">🤖 {message["content"]}</div>', unsafe_allow_html=True)
-        
-        # Input form to prevent auto-rerun
-        with st.form(key="chat_form", clear_on_submit=True):
+        # Search form
+        with st.form(key="search_form", clear_on_submit=True):
             col1, col2 = st.columns([4, 1])
             
             with col1:
-                user_input = st.text_input(
-                    "Ask about your document:",
-                    placeholder="e.g., What is the main topic of this document?",
-                    key="user_question"
+                search_query = st.text_input(
+                    "Search for information in your document:",
+                    placeholder="e.g., vision, strategy, main goals, key findings...",
+                    key="search_input"
                 )
             
             with col2:
-                submit_button = st.form_submit_button("Send 📤")
-                reset_button = st.form_submit_button("Reset 🔄")
+                search_button = st.form_submit_button("🔍 Search")
+                clear_button = st.form_submit_button("🗑️ Clear")
         
-        # Process form submission
-        if submit_button and user_input.strip():
-            # Add user message
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            
-            # Generate response
-            with st.spinner("🤔 Thinking..."):
-                retrieved_chunks = st.session_state.retriever.retrieve_top_chunks(user_input, 3)
-                
-                # Debug info (remove in production)
-                if retrieved_chunks:
-                    max_score = max(score for _, score in retrieved_chunks)
-                    st.write(f"Debug: Max similarity score: {max_score:.3f}")
-                
-                response = query_claude(st.session_state.client, user_input, retrieved_chunks)
-            
-            # Add bot response
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            
-            # Rerun to show new messages
-            st.rerun()
+        # Process search
+        if search_button and search_query.strip():
+            with st.spinner("🔍 Searching document..."):
+                results = st.session_state.retriever.search_document(search_query, 5)
+                st.session_state.search_results = results
+                st.session_state.last_query = search_query
         
-        # Reset functionality
-        if reset_button:
-            st.session_state.messages = []
-            st.success("🗑️ Chat history cleared!")
-            st.rerun()
+        # Clear results
+        if clear_button:
+            st.session_state.search_results = []
+            st.success("🗑️ Search results cleared!")
         
-        # Show statistics
-        if st.session_state.messages:
-            user_msg_count = len([msg for msg in st.session_state.messages if msg["role"] == "user"])
+        # Display search results
+        if st.session_state.search_results:
+            st.subheader(f"📋 Search Results for: '{st.session_state.get('last_query', '')}'")
+            
+            for i, (chunk, score) in enumerate(st.session_state.search_results):
+                if score > 0:  # Only show relevant results
+                    st.markdown(f"""
+                    <div class="search-result">
+                        <div class="relevance-score">Relevance: {score:.1%}</div>
+                        <strong>Section {i+1}:</strong><br>
+                        {chunk[:500]}{'...' if len(chunk) > 500 else ''}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Show full text option
+                    if len(chunk) > 500:
+                        with st.expander(f"📖 Read full Section {i+1}"):
+                            st.write(chunk)
+            
+            # No relevant results found
+            if all(score == 0 for _, score in st.session_state.search_results):
+                st.markdown("""
+                <div class="warning-box">
+                    🤷‍♂️ No highly relevant sections found. Try different keywords or check the key topics above.
+                </div>
+                """, unsafe_allow_html=True)
+        
+        # Usage tips
+        with st.expander("💡 Search Tips"):
+            st.markdown("""
+            **How to search effectively:**
+            - Use specific keywords from your document
+            - Try different variations of terms
+            - Look at the key topics shown above for guidance
+            - Use 2-4 words for best results
+            
+            **Example searches:**
+            - "company vision" → finds vision statements
+            - "financial results" → finds financial data
+            - "recommendations" → finds suggested actions
+            - "methodology" → finds research methods
+            """)
+        
+        # Document statistics
+        if st.session_state.chunks:
             st.markdown(f"""
             <div class="info-box">
-                📊 <strong>Chat Stats:</strong> {user_msg_count} questions asked
+                📊 <strong>Document Stats:</strong> 
+                {len(st.session_state.chunks)} sections • 
+                {len(st.session_state.keywords)} key topics identified •
+                Search method: {'TF-IDF Similarity' if sklearn_available else 'Keyword Matching'}
             </div>
             """, unsafe_allow_html=True)
     
@@ -430,18 +410,22 @@ numpy</pre>
         st.markdown("""
         ### 📤 Upload Your PDF Document
         
-        Upload a PDF file above to start chatting with your document using Claude AI.
+        **This is a FREE tool** that helps you search and find information in your PDF documents without requiring any API keys or subscriptions.
         
-        **Features:**
-        - 🔤 Smart text processing
-        - 🔍 Intelligent content retrieval  
-        - 🤖 Powered by Claude AI
-        - 💬 Interactive chat interface
+        **What you can do:**
+        - 🔍 **Search** for specific topics, keywords, or concepts
+        - 📊 **View relevance scores** to see how well results match your query
+        - 📖 **Read full sections** that contain your searched terms
+        - 🏷️ **Discover key topics** automatically extracted from your document
         
-        **Example Questions:**
-        - "What is this document about?"
-        - "What are the main points?"
-        - "Summarize the key findings"
+        **Perfect for:**
+        - Research papers and reports
+        - Business documents and manuals
+        - Legal documents and contracts
+        - Academic papers and thesis documents
+        - Technical documentation
+        
+        **No limits, no costs, no API keys needed!**
         """)
 
 if __name__ == "__main__":
